@@ -64,15 +64,20 @@ class TestWeixinFormatting:
 
 
 class TestWeixinChunking:
-    def test_split_text_keeps_short_multiline_message_in_single_chunk(self):
+    def test_split_text_packs_short_lines_into_fewer_messages(self):
+        """Short lines should be packed together up to MAX_MESSAGE_LENGTH
+        rather than sent as individual messages."""
         adapter = _make_adapter()
 
         content = adapter.format_message("第一行\n第二行\n第三行")
         chunks = adapter._split_text(content)
 
+        # All three short lines fit in one message (well under 4000 chars)
         assert chunks == ["第一行\n第二行\n第三行"]
 
-    def test_split_text_keeps_short_reformatted_table_in_single_chunk(self):
+    def test_split_text_keeps_indented_followup_with_previous_line(self):
+        """Table rows (indented continuation) stay with their parent, and
+        adjacent short rows are packed together."""
         adapter = _make_adapter()
 
         content = adapter.format_message(
@@ -83,7 +88,10 @@ class TestWeixinChunking:
         )
         chunks = adapter._split_text(content)
 
-        assert chunks == [content]
+        # Both rows are short enough to pack into one message
+        assert chunks == [
+            "- Setting: Timeout\n  Value: 30s\n- Setting: Retries\n  Value: 3",
+        ]
 
     def test_split_text_keeps_complete_code_block_together_when_possible(self):
         adapter = _make_adapter()

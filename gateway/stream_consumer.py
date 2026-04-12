@@ -269,6 +269,22 @@ class GatewayStreamConsumer:
                 # a real string like "msg_1", not "__no_edit__", so that case
                 # still resets and creates a fresh segment as intended.)
                 if got_segment_break:
+                    # Flush accumulated-but-unseen content before starting a
+                    # new segment.  Without this, platforms that don't support
+                    # edit_message (e.g. WeChat) silently discard all text that
+                    # accumulated between the first send and the tool boundary.
+                    # Only flush when edits actually failed mid-stream (flood
+                    # control, etc.) — not when the initial send succeeded but
+                    # returned no message_id (__no_edit__), because in that
+                    # case the text was already delivered to the user and
+                    # calling _send_fallback_final would prematurely end the
+                    # stream.
+                    if (
+                        self._accumulated
+                        and self._fallback_final_send
+                        and self._message_id != "__no_edit__"
+                    ):
+                        await self._send_fallback_final(self._accumulated)
                     self._reset_segment_state(preserve_no_edit=True)
 
                 await asyncio.sleep(0.05)  # Small yield to not busy-loop

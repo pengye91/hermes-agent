@@ -763,9 +763,8 @@ def _split_text_for_weixin_delivery(
     """Split content into sequential Weixin messages.
 
     *compact* (default): Keep everything in a single message whenever it fits
-    within the platform limit, even when the author used explicit line breaks.
-    Only fall back to block-aware packing when the payload exceeds
-    ``max_length``.
+    within the platform limit.  When content exceeds ``max_length``, delivery
+    units are greedily packed together to minimise the number of messages.
 
     *per_line* (``split_per_line=True``): Legacy behavior — top-level line
     breaks become separate chat messages; oversized units still use
@@ -790,7 +789,31 @@ def _split_text_for_weixin_delivery(
     # Compact (default): single message when under the limit.
     if len(content) <= max_length:
         return [content]
-    return _pack_markdown_blocks_for_weixin(content, max_length) or [content]
+
+    # Greedy packing: combine short delivery units up to max_length.
+    chunks: List[str] = []
+    current = ""
+
+    for unit in _split_delivery_units_for_weixin(content):
+        if len(unit) > max_length:
+            # Unit itself exceeds limit — flush current, then split unit
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(_pack_markdown_blocks_for_weixin(unit, max_length))
+            continue
+
+        candidate = unit if not current else f"{current}\n\n{unit}"
+        if len(candidate) <= max_length:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = unit
+
+    if current:
+        chunks.append(current)
+    return chunks or [content]
 
 
 def _coerce_bool(value: Any, default: bool = True) -> bool:
