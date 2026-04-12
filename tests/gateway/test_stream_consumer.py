@@ -242,6 +242,33 @@ class TestSegmentBreakOnToolBoundary:
         assert "Final answer" in adapter.send.call_args_list[0][1]["content"]
 
     @pytest.mark.asyncio
+    async def test_first_send_strips_cursor(self):
+        """The initial send should never include the streaming cursor —
+        on platforms that do not support edit_message (e.g. WeChat) the
+        cursor would be permanently visible otherwise."""
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id="msg_1")
+        edit_result = SimpleNamespace(success=False, error="not supported")
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.edit_message = AsyncMock(return_value=edit_result)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer.on_delta("Hello")
+        consumer.finish()
+
+        await consumer.run()
+
+        # The first send must NOT contain the cursor
+        first_send_text = adapter.send.call_args_list[0][1]["content"]
+        assert "▉" not in first_send_text, (
+            f"Cursor leaked into first send: {first_send_text!r}"
+        )
+        assert first_send_text == "Hello"
+
+    @pytest.mark.asyncio
     async def test_segment_break_removes_cursor(self):
         """The finalized segment message should not have a cursor."""
         adapter = MagicMock()
@@ -384,7 +411,7 @@ class TestSegmentBreakOnToolBoundary:
         await task
 
         sent_texts = [call[1]["content"] for call in adapter.send.call_args_list]
-        assert sent_texts == ["Hello ▉", "world", "Next segment"]
+        assert sent_texts == ["Hello", "world", "Next segment"]
 
     @pytest.mark.asyncio
     async def test_no_message_id_enters_fallback_mode(self):
@@ -583,6 +610,6 @@ class TestInterimCommentaryMessages:
         await task
 
         sent_texts = [call[1]["content"] for call in adapter.send.call_args_list]
-        assert sent_texts == ["Hello ▉", "world"]
+        assert sent_texts == ["Hello", "world"]
         assert consumer.already_sent is True
         assert consumer.final_response_sent is True
