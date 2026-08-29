@@ -211,15 +211,90 @@ def test_related_encodes_role_atoms_once(hoisted_retriever, monkeypatch):
     )
 
 
-def test_probe_encodes_role_atom_once(hoisted_retriever, monkeypatch):
+def test_probe_never_encodes_role_content(hoisted_retriever, monkeypatch):
+    """probe() scores presence of bind(entity, ROLE_ENTITY) via the identity
+    DC spike; it has no use for the content-role atom at all."""
     calls = _counting_spy(monkeypatch, "encode_atom")
     results = hoisted_retriever.probe("entity_1")
     assert results
     role_content_calls = [a for a in calls
                           if a and a[0] == "__hrr_role_content__"]
-    assert len(role_content_calls) == 1, (
-        f"role_content atom encoded {len(role_content_calls)}x in one "
-        "probe() — loop-invariant hoist regressed"
+    assert role_content_calls == [], (
+        f"probe() encoded __hrr_role_content__ {len(role_content_calls)}x — "
+        "stale comparison path resurfaced"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Behavioral ranking: probe/related/reason must rank facts containing the
+# queried structure ABOVE facts that don't. The pre-fix implementations
+# compared unbind residuals against unrelated vectors, which returned pure
+# noise regardless of structural presence.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def ranked_retriever(tmp_path):
+    """Facts where specific entities/words clearly separate relevant from not."""
+    store = MemoryStore(str(tmp_path / "rank_store.db"))
+    # DASH-linked facts (quoted -> entity extraction links them)
+    store.add_fact(content='Quitting employment unlocks "DASH" trading.',
+                   category="project")
+    store.add_fact(content='No "DASH" buys until October. Next vest in November.',
+                   category="project")
+    # Facts WITHOUT any DASH connection
+    store.add_fact(content="Badminton twice a week keeps the resting heart rate down.",
+                   category="general")
+    store.add_fact(content="The Thursday deployment rollback failed on stale migration state.",
+                   category="project")
+    retriever = FactRetriever(store=store)
+    yield retriever
+    store.close()
+
+
+def test_probe_ranks_linked_facts_first(ranked_retriever):
+    results = ranked_retriever.probe("DASH", limit=4)
+    assert len(results) >= 2
+    top_two = [r["content"].lower() for r in results[:2]]
+    assert all("dash" in c for c in top_two), (
+        f"probe() top-2 not DASH facts: {top_two}"
+    )
+
+
+def test_related_ranks_structural_matches_first(ranked_retriever):
+    results = ranked_retriever.related("badminton", limit=4)
+    assert results
+    assert "badminton" in results[0]["content"].lower(), (
+        f"related() top hit misses the queried word: {results[0]['content']!r}"
+    )
+
+
+def test_reason_requires_all_entities(ranked_retriever):
+    store = ranked_retriever.store
+    store.add_fact(content='"Manan" drafted the "RNOR" relocation tax plan.',
+                   category="project")
+    hits = ranked_retriever.reason(["Manan", "RNOR"], limit=5)
+    assert hits
+    assert "manan" in hits[0]["content"].lower()
+    assert "rnor" in hits[0]["content"].lower()
+
+
+def test_presence_separates_bound_from_unbound():
+    """Unit contract for hrr.presence(): a key bound into a vector must score
+    far above an unrelated key."""
+    rng_key = hrr.encode_atom("dash", 1024)
+    other_key = hrr.encode_atom("totally-unrelated-atom", 1024)
+    role = hrr.encode_atom("__hrr_role_entity__", 1024)
+    fact_vec = hrr.encode_fact(
+        "plain content words here", entities=["dash"], dim=1024,
+    )
+    bound_score = hrr.presence(fact_vec, hrr.bind(rng_key, role))
+    noise_floor = max(
+        abs(hrr.presence(fact_vec, hrr.bind(other_key, role))),
+        0.05,  # empirical noise ceiling at this bundle width
+    )
+    assert bound_score > 3 * noise_floor, (
+        f"bound={bound_score:.4f} vs noise floor {noise_floor:.4f} — "
+        "presence() lost the DC signal"
     )
 
 
