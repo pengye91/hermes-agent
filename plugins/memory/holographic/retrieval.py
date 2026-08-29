@@ -667,13 +667,59 @@ class FactRetriever:
           - strips FTS5 special characters from each token
           - OR-joins the survivors
 
+        For CJK-containing queries, the trigram tokenizer can only match
+        contiguous 3-char windows, so a whole natural-language question
+        almost never appears verbatim in a document. CJK text is therefore
+        expanded into overlapping 3-char shingles and OR-joined — any
+        shingle hit retrieves the fact, and the Jaccard rerank (with CJK
+        bigrams) orders the candidates. Queries whose CJK runs are all
+        shorter than 3 chars return "" so the caller's LIKE fallback runs.
+
         If nothing remains (pathological query), falls back to the raw
         query so the caller sees zero results instead of a SQL error.
         """
         if not query:
             return ""
-        # Strip FTS5 operator characters from EACH token to avoid
-        # accidentally creating a malformed query.
+
+        # CJK path: shingle expansion
+        if cls._has_cjk(query):
+            cjk_runs: list[str] = []
+            current: list[str] = []
+            for ch in query:
+                if cls._is_cjk_char(ch):
+                    current.append(ch)
+                else:
+                    if current:
+                        cjk_runs.append("".join(current))
+                        current = []
+            if current:
+                cjk_runs.append("".join(current))
+
+            shingles: set[str] = set()
+            latin_tokens: list[str] = []
+            for run in cjk_runs:
+                if len(run) >= 3:
+                    shingles.update(run[i:i+3] for i in range(len(run) - 2))
+                elif len(run) >= 2:
+                    pass  # sub-trigram run: leave for LIKE fallback signal
+            # latin/digit tokens in a mixed query still go through the
+            # normal phrase-literal path. Keep hyphens: trigram indexes
+            # them verbatim and stripping them breaks exact-term recall
+            # ("daemon-reexec" -> "daemonreexec" matches nothing).
+            for raw in query.split():
+                cleaned = raw.strip(".,;:!?\"'()[]{}#@<>").translate(
+                    str.maketrans("", "", '"()*^:+'))
+                if len(cleaned) >= 2 and cleaned not in cls._FTS_STOPWORDS \
+                        and not cls._has_cjk(cleaned):
+                    latin_tokens.append(f'"{cleaned}"')
+
+            or_parts = [f'"{s}"' for s in shingles] + latin_tokens
+            if or_parts:
+                return " OR ".join(or_parts)
+            # all CJK runs < 3 chars → let LIKE fallback handle it
+            return query
+
+        # Latin-only path (original behaviour)
         _FTS_SPECIAL = '"()*^:-+'
         tokens: list[str] = []
         for raw in query.lower().split():
