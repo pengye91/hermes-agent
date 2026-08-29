@@ -115,6 +115,22 @@ def similarity(a: "np.ndarray", b: "np.ndarray") -> float:
     return float(np.mean(np.cos(a - b)))
 
 
+def presence(fact_vector: "np.ndarray", key: "np.ndarray") -> float:
+    """Structural-presence score: how strongly ``key`` participates in ``fact_vector``.
+
+    Unbinding a component that was bound into the vector leaves a zero-phase
+    (identity) DC spike in the residual — mean cosine ~0.5+ per binding at
+    practical bundle widths — while an unrelated key leaves zero-mean noise.
+    Reading the residual's DC term measures presence directly; comparing the
+    residual against any other vector (content bundle, role atom) cannot
+    recover this signal and returns noise regardless of presence.
+
+    Range [-1, 1]; clamp at 0 before using as a score multiplier.
+    """
+    _require_numpy()
+    return float(np.mean(np.cos(unbind(fact_vector, key))))
+
+
 def encode_text(text: str, dim: int = 1024) -> "np.ndarray":
     """Bag-of-words: bundle of atom vectors for each token.
 
