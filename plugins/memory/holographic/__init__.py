@@ -305,9 +305,20 @@ class HolographicMemoryProvider(MemoryProvider):
         return bool(fact.get("category")) and fact["category"] in set(self._prefetch_categories)
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        # Holographic memory stores explicit facts via tools, not auto-sync.
-        # The on_session_end hook handles auto-extraction if configured.
-        pass
+        # Per-turn trigger for the corpus distillation pipeline. The session-
+        # end hook exists but under session_reset.mode: none (this host's
+        # group-session setup) on_session_end almost never fires, so the
+        # per-turn path is the routine one. note_turn() is lock-guarded and
+        # returns in microseconds; the actual subprocess runs on a daemon
+        # timer thread (debounce 5min quiet / 30min hard cap), never on the
+        # memory manager's serialized worker.
+        if not is_truthy_value(self._config.get("auto_extract", False)):
+            return
+        try:
+            from .session_distill import note_turn
+            note_turn()
+        except Exception as e:
+            logger.debug("sync_turn distill note failed: %s", e)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [FACT_STORE_SCHEMA, FACT_FEEDBACK_SCHEMA]
@@ -365,6 +376,13 @@ class HolographicMemoryProvider(MemoryProvider):
             logger.debug("Holographic memory_write mirror failed: %s", e)
 
     def shutdown(self) -> None:
+        # Cancel any pending debounce timer so a torn-down provider stops
+        # scheduling distill runs (the daily cron still back-fills).
+        try:
+            from .session_distill import cancel_scheduler
+            cancel_scheduler()
+        except Exception:
+            pass
         # Release the shared SQLite connection deterministically on the
         # caller's thread. Dropping the reference alone leaves fd finalization
         # to GC, which keeps the connection (and its write lock) alive on a
