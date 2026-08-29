@@ -146,9 +146,13 @@ class FactRetriever:
         # Sort by score descending, return top limit
         scored.sort(key=lambda x: x["score"], reverse=True)
         results = scored[:limit]
-        # Strip raw HRR bytes — callers expect JSON-serializable dicts
+        # Strip raw binary columns — callers expect JSON-serializable dicts.
+        # f.* in _fts_candidates carries hrr_vector AND embedding (both BLOB);
+        # NULL embedding used to make this latent (None is JSON-safe), so it
+        # only surfaced once facts got real embeddings.
         for fact in results:
             fact.pop("hrr_vector", None)
+            fact.pop("embedding", None)
         return results
 
     _RRF_K = 60
@@ -232,6 +236,7 @@ class FactRetriever:
         for row in rows:
             fact = dict(row)
             fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"), dim=self.hrr_dim)
+            fact.pop("embedding", None)  # BLOB → not JSON-serializable
             # Structural presence of bind(entity, ROLE_ENTITY) in the fact:
             # unbinding a bound-in component leaves an identity DC spike;
             # unrelated keys leave zero-mean noise.
@@ -298,6 +303,7 @@ class FactRetriever:
         for row in rows:
             fact = dict(row)
             fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"), dim=self.hrr_dim)
+            fact.pop("embedding", None)  # BLOB → not JSON-serializable
 
             # Structural presence via identity DC spike: a component that was
             # bound into the fact leaves a zero-phase spike when unbound;
@@ -376,6 +382,7 @@ class FactRetriever:
         for row in rows:
             fact = dict(row)
             fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"), dim=self.hrr_dim)
+            fact.pop("embedding", None)  # BLOB → not JSON-serializable
 
             # Presence via identity DC spike (see probe/related). min() keeps
             # AND semantics: every queried entity must have been bound in.

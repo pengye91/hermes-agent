@@ -195,6 +195,7 @@ def test_search_results_bit_identical_to_unhoisted(hoisted_retriever):
     old_results = scored[:10]
     for fact in old_results:
         fact.pop("hrr_vector", None)
+        fact.pop("embedding", None)  # search() strips binary cols; parity on scoring/ranking
 
     assert new_results == old_results
 
