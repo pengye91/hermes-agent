@@ -2,20 +2,23 @@
 context-compaction handoff summaries into fact_store, and ran even when
 configured off.
 
-Two compounding defects:
+2026-08-29 UPDATE: the English-regex harvester (_auto_extract_facts) has been
+replaced by the LLM distillation hook (session_distill.py). These tests now
+verify the SURVIVING contract of ``on_session_end``:
 
-1. Gate: the plugin's config schema declares ``auto_extract`` as a string enum
-   (``"false"``/``"true"``), and the ``on_session_end`` gate used plain
-   truthiness — ``not "false"`` is ``False`` — so extraction ran despite being
-   explicitly configured off.
+1. Gate: every false-y value of ``auto_extract`` (string enum "false" etc.)
+   must keep the hook disabled — no subprocess, no facts. (Unchanged #57682.)
+2. Enabled: the hook fires the distill subprocess exactly once, and facts are
+   produced by the subprocess (not inline) — so the provider store stays
+   untouched by the hook itself.
+3. Failure containment: subprocess errors never propagate.
 
-2. Eligibility: ``_auto_extract_facts`` scanned every ``role == "user"``
-   message. Compaction handoff summaries can be inserted as ``role="user"``
-   messages, and their prose reliably matches the decision patterns
-   (``we decided/agreed/chose``, ``the project uses/needs/requires``), so the
-   compactor's own output was stored as a durable ``project`` fact on every
-   session rollover that followed a compaction.
+The old "summary prose not harvested" concern is now handled downstream by
+the LLM distiller's semantic filtering in distill_llm.py (prompt rule 4:
+discard 客套/反思/过渡), no longer by regex here.
 """
+
+from unittest import mock
 
 import pytest
 
@@ -27,6 +30,7 @@ from agent.context_compressor import (
     is_compaction_summary_message,
 )
 from plugins.memory.holographic import HolographicMemoryProvider
+from plugins.memory.holographic import session_distill
 
 
 def _make_provider(tmp_path, **config):
@@ -47,6 +51,10 @@ def _user(content, **extra):
     return msg
 
 
+def _ok_run(*args, **kwargs):
+    return mock.Mock(returncode=0, stdout="", stderr="")
+
+
 DECISION_MSG = "we decided to use PostgreSQL for the persistence layer"
 SUMMARY_MSG = (
     f"{SUMMARY_PREFIX}\n## Historical Task Snapshot\n"
@@ -56,74 +64,45 @@ SUMMARY_MSG = (
 
 
 # ---------------------------------------------------------------------------
-# Defect 1 — string-boolean gate
+# Defect 1 — string-boolean gate (unchanged)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("off_value", [False, "false", "False", "no", "off", "0", None, ""])
 def test_auto_extract_off_values_disable_extraction(tmp_path, off_value):
     provider = _make_provider(tmp_path, auto_extract=off_value)
-    provider.on_session_end([_user(DECISION_MSG)])
+    with mock.patch.object(session_distill.subprocess, "run", side_effect=_ok_run) as run:
+        provider.on_session_end([_user(DECISION_MSG)])
+    assert run.call_count == 0
     assert _fact_contents(provider) == []
     provider.shutdown()
 
 
 # ---------------------------------------------------------------------------
-# Defect 2 — compaction summaries harvested as facts
+# Enabled path — fires the distill subprocess, nothing inline
 # ---------------------------------------------------------------------------
 
 
-def test_compaction_summary_not_harvested(tmp_path):
-    """The exact failure mode from #57682: summary prose matches the decision
-    patterns but must not become a fact."""
+def test_enabled_fires_distill_subprocess_once(tmp_path):
     provider = _make_provider(tmp_path, auto_extract=True)
-    provider.on_session_end([_user(SUMMARY_MSG)])
+    with mock.patch.object(session_distill.subprocess, "run", side_effect=_ok_run) as run:
+        provider.on_session_end([_user(DECISION_MSG)])
+    assert run.call_count == 1
+    # Inline store untouched — facts come from the subprocess pipeline
     assert _fact_contents(provider) == []
     provider.shutdown()
 
 
-def test_metadata_marked_summary_not_harvested(tmp_path):
-    """In-process summaries carry COMPRESSED_SUMMARY_METADATA_KEY even if a
-    future prefix rewrite changes the content sentinel."""
+def test_subprocess_failure_never_propagates(tmp_path):
     provider = _make_provider(tmp_path, auto_extract=True)
-    marked = _user(DECISION_MSG, **{COMPRESSED_SUMMARY_METADATA_KEY: True})
-    provider.on_session_end([marked])
-    assert _fact_contents(provider) == []
-    provider.shutdown()
-
-
-def test_merged_into_tail_summary_suffix_not_harvested_prefix_content_ignored(tmp_path):
-    """Merge-into-tail summaries embed the handoff prefix after the delimiter,
-    not at the start of the message. The wrapped pre-delimiter segment here has
-    no fact-pattern match, so nothing is harvested from either side."""
-    provider = _make_provider(tmp_path, auto_extract=True)
-    merged = _user(
-        f"{_MERGED_PRIOR_CONTEXT_HEADER}\nplease fix the login bug\n"
-        f"{_MERGED_SUMMARY_DELIMITER}\n{SUMMARY_MSG}"
-    )
-    provider.on_session_end([merged])
-    assert _fact_contents(provider) == []
-    provider.shutdown()
-
-
-def test_real_user_messages_still_extracted_alongside_summary(tmp_path):
-    """The guard must skip only the summary, not suppress extraction for the
-    genuine user turns around it."""
-    provider = _make_provider(tmp_path, auto_extract=True)
-    provider.on_session_end(
-        [
-            _user(SUMMARY_MSG),
-            _user("I prefer tabs over spaces for indentation"),
-        ]
-    )
-    facts = _fact_contents(provider)
-    assert len(facts) == 1
-    assert "tabs over spaces" in facts[0]
+    with mock.patch.object(session_distill.subprocess, "run",
+                           side_effect=RuntimeError("boom")):
+        provider.on_session_end([_user(DECISION_MSG)])  # must not raise
     provider.shutdown()
 
 
 # ---------------------------------------------------------------------------
-# is_compaction_summary_message — public helper contract
+# is_compaction_summary_message — public helper contract (unchanged)
 # ---------------------------------------------------------------------------
 
 

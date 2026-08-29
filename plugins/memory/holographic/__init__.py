@@ -325,9 +325,17 @@ class HolographicMemoryProvider(MemoryProvider):
         # "false" as enabled (#57682).
         if not is_truthy_value(self._config.get("auto_extract", False)):
             return
-        if not self._store or not messages:
+        if not messages:
             return
-        self._auto_extract_facts(messages)
+        # LLM distillation pipeline (session_distill.py): the production
+        # corpus path shared with the cron/manual runs. Replaces the English
+        # regex harvester (_auto_extract_facts) which never matched Chinese.
+        from .session_distill import run_session_distillation
+        try:
+            run_session_distillation(messages)
+        except Exception as e:  # containment: never fail the manager worker
+            logger.warning("session distillation hook failed: %s", e)
+        return
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes as facts (add AND remove, so the
