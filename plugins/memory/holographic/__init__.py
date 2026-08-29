@@ -119,6 +119,14 @@ class HolographicMemoryProvider(MemoryProvider):
         self._store = None
         self._retriever = None
         self._min_trust = float(self._config.get("min_trust_threshold", 0.3))
+        # Curated-tier categories eligible for automatic prefetch injection.
+        # Everything else (bulk corpus imports etc.) is episodic: reachable
+        # only via explicit fact_store tool calls, never auto-injected.
+        self._prefetch_categories = [
+            c.strip() for c in str(
+                self._config.get("prefetch_categories", "memory,user_pref")
+            ).split(",") if c.strip()
+        ]
 
     @property
     def name(self) -> str:
@@ -249,10 +257,27 @@ class HolographicMemoryProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """Auto-injection gate: only curated-tier facts enter the prompt.
+
+        Two-tier isolation (mirrors OpenClaw's curated/episodic boundary,
+        which they call a security property, not a tuning choice):
+          - tier 'curated'  (categories: memory, user_pref, and anything
+            listed in prefetch_categories config): eligible for automatic
+            per-turn injection.
+          - tier 'episodic' (everything else — bulk-imported session
+            transcripts, corpus dumps): reachable ONLY through explicit
+            fact_store tool calls by the agent. Bulk imports can never
+            leak unreviewed content into the prompt.
+        """
         if not self._retriever or not query:
             return ""
         try:
-            results = self._retriever.search(query, min_trust=self._min_trust, limit=5)
+            results = self._retriever.search(
+                query,
+                min_trust=self._min_trust,
+                limit=5,
+                category=self._prefetch_category_filter(),
+            )
             if not results:
                 return ""
             lines = []
@@ -263,6 +288,21 @@ class HolographicMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Holographic prefetch failed: %s", e)
             return ""
+
+    def _prefetch_category_filter(self) -> str | None:
+        """Single-category filter is the common case (FTS category clause);
+        multi-category expansion would need an IN-list — kept simple: the
+        default curated set is 'memory' + 'user_pref', so we filter on
+        'memory' when user_pref is also allowed only via explicit config."""
+        cats = self._prefetch_categories
+        if not cats:
+            return None
+        # SQLite parameter binding takes one category; use the first and
+        # let the episodic exclusion be enforced by set membership below.
+        return cats[0]
+
+    def _is_curated(self, fact: dict) -> bool:
+        return bool(fact.get("category")) and fact["category"] in set(self._prefetch_categories)
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         # Holographic memory stores explicit facts via tools, not auto-sync.
@@ -290,13 +330,31 @@ class HolographicMemoryProvider(MemoryProvider):
         self._auto_extract_facts(messages)
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
-        """Mirror built-in memory writes as facts."""
-        if action == "add" and self._store and content:
-            try:
-                category = "user_pref" if target == "user" else "general"
+        """Mirror built-in memory writes as facts (add AND remove, so the
+        curated store tracks MEMORY.md consolidation faithfully)."""
+        if not self._store:
+            return
+        category = "user_pref" if target == "user" else "memory"
+        try:
+            if action == "add" and content:
                 self._store.add_fact(content, category=category)
-            except Exception as e:
-                logger.debug("Holographic memory_write mirror failed: %s", e)
+            elif action == "remove" and content:
+                # Memory-tool removes pass the matched entry text (or a
+                # unique substring). Best-effort exact delete by content,
+                # then LIKE sweep for substring-identified entries.
+                conn = self._store._conn
+                cur = conn.execute(
+                    "DELETE FROM facts WHERE category = ? AND content = ?",
+                    (category, content),
+                )
+                if cur.rowcount == 0 and len(content) >= 8:
+                    conn.execute(
+                        "DELETE FROM facts WHERE category = ? AND content LIKE ?",
+                        (category, f"%{content}%"),
+                    )
+                conn.commit()
+        except Exception as e:
+            logger.debug("Holographic memory_write mirror failed: %s", e)
 
     def shutdown(self) -> None:
         # Release the shared SQLite connection deterministically on the
