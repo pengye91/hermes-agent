@@ -47,23 +47,22 @@ CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(category);
 CREATE INDEX IF NOT EXISTS idx_entities_name  ON entities(name);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
-    USING fts5(content, tags, content=facts, content_rowid=fact_id);
-
+    USING fts5(content, tags, tokenize='trigram');
 CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
     INSERT INTO facts_fts(rowid, content, tags)
-        VALUES (new.fact_id, new.content, new.tags);
+        VALUES (new.fact_id, COALESCE(new.content,''), COALESCE(new.tags,''));
 END;
 
 CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
     INSERT INTO facts_fts(facts_fts, rowid, content, tags)
-        VALUES ('delete', old.fact_id, old.content, old.tags);
+        VALUES ('delete', old.fact_id, COALESCE(old.content,''), COALESCE(old.tags,''));
 END;
 
 CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
     INSERT INTO facts_fts(facts_fts, rowid, content, tags)
-        VALUES ('delete', old.fact_id, old.content, old.tags);
+        VALUES ('delete', old.fact_id, COALESCE(old.content,''), COALESCE(old.tags,''));
     INSERT INTO facts_fts(rowid, content, tags)
-        VALUES (new.fact_id, new.content, new.tags);
+        VALUES (new.fact_id, COALESCE(new.content,''), COALESCE(new.tags,''));
 END;
 
 CREATE TABLE IF NOT EXISTS memory_banks (
@@ -180,6 +179,31 @@ class MemoryStore:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
+        # Migrate: legacy facts_fts used external-content mode (content=facts)
+        # with the default unicode61 tokenizer — CJK text was unindexed and
+        # the external-content table can silently return 0 rows under
+        # trigram. Detect the legacy shape and rebuild as a standalone
+        # trigram table repopulated from facts.
+        fts_sql_row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'facts_fts'"
+        ).fetchone()
+        if fts_sql_row and "trigram" not in (fts_sql_row[0] or ""):
+            self._conn.executescript(
+                """
+                DROP TRIGGER IF EXISTS facts_ai;
+                DROP TRIGGER IF EXISTS facts_ad;
+                DROP TRIGGER IF EXISTS facts_au;
+                DROP TABLE IF EXISTS facts_fts;
+                """
+            )
+            self._conn.executescript(_SCHEMA)
+            self._conn.execute(
+                """
+                INSERT INTO facts_fts(rowid, content, tags)
+                SELECT fact_id, COALESCE(content, ''), COALESCE(tags, '')
+                FROM facts
+                """
+            )
         self._conn.commit()
 
     # ------------------------------------------------------------------

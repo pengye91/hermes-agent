@@ -487,6 +487,14 @@ class FactRetriever:
             # FTS5 MATCH can fail on malformed queries — fall back to empty
             return []
 
+        # CJK short-token fallback: the trigram tokenizer cannot match
+        # queries shorter than 3 CJK characters (e.g. "芯片", "智谱").
+        # When the query contains CJK and MATCH returned nothing, retry
+        # with substring LIKE on content+tags — the same production-proven
+        # pattern the CLS news database uses for 2-char Chinese queries.
+        if not rows and self._has_cjk(query):
+            rows = self._like_fallback(conn, query, category, min_trust, limit)
+
         if not rows:
             return []
 
@@ -505,21 +513,93 @@ class FactRetriever:
 
         return results
 
+    def _like_fallback(
+        self,
+        conn,
+        query: str,
+        category: str | None,
+        min_trust: float,
+        limit: int,
+    ) -> list:
+        """Substring fallback for short CJK tokens (<3 chars) that trigram
+        FTS5 cannot index. Scans content+tags with LIKE; rank by number of
+        matched substrings so the caller's rerank stages still see signal.
+        """
+        # Extract CJK runs from the sanitized query
+        runs: list[str] = []
+        current: list[str] = []
+        for ch in query:
+            if self._is_cjk_char(ch):
+                current.append(ch)
+            else:
+                if current:
+                    runs.append("".join(current))
+                    current = []
+        if current:
+            runs.append("".join(current))
+        if not runs:
+            return []
+
+        # Use the longest run as the primary LIKE pattern (most specific)
+        primary = max(runs, key=len)
+        like_clause = " OR ".join(
+            ["(f.content LIKE ? ESCAPE '\\')", "(f.tags LIKE ? ESCAPE '\\')"]
+        )
+        pattern = f"%{primary.replace('%', chr(92) + '%')}%"
+
+        sql = f"""
+            SELECT f.*, 1.0 as fts_rank_raw
+            FROM facts f
+            WHERE ({like_clause})
+        """
+        params: list = [pattern, pattern]
+        if category:
+            sql += " AND f.category = ?"
+            params.append(category)
+        sql += " AND f.trust_score >= ?"
+        params.append(min_trust)
+        sql += " ORDER BY f.updated_at DESC LIMIT ?"
+        params.append(limit)
+
+        try:
+            return conn.execute(sql, params).fetchall()
+        except Exception:
+            return []
+
     @staticmethod
     def _tokenize(text: str) -> set[str]:
-        """Simple whitespace tokenization with lowercasing.
+        """Whitespace tokenization with lowercasing + CJK bigram expansion.
 
         Strips common punctuation. No stemming/lemmatization (Phase 1).
+        For CJK text (no whitespace boundaries), falls back to character
+        bigrams so Jaccard reranking sees Chinese signal — mirrors the
+        SimHash trigram approach used by the CLS news pipeline.
         """
         if not text:
             return set()
-        # Split on whitespace, lowercase, strip punctuation
-        tokens = set()
+        tokens: set[str] = set()
         for word in text.lower().split():
             cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
-            if cleaned:
-                tokens.add(cleaned)
+            if not cleaned:
+                continue
+            cjk_chars = [ch for ch in cleaned if FactRetriever._is_cjk_char(ch)]
+            non_cjk = "".join(ch for ch in cleaned if not FactRetriever._is_cjk_char(ch))
+            # Keep latin/digit runs as whole tokens
+            for part in non_cjk.replace("/", " ").replace("=", " ").split():
+                if part:
+                    tokens.add(part)
+            # CJK: character bigrams (unigrams too for 1-char entities)
+            if cjk_chars:
+                run = "".join(cjk_chars)
+                if len(run) == 1:
+                    tokens.add(run)
+                else:
+                    tokens.update(run[i:i+2] for i in range(len(run) - 1))
         return tokens
+
+    @classmethod
+    def _is_cjk_char(cls, ch: str) -> bool:
+        return any(lo <= ord(ch) <= hi for lo, hi in cls._CJK_RANGES)
 
     # Stopwords dropped before FTS5 OR-expansion. Short English function
     # words that carry no retrieval signal and force false-negative AND
@@ -541,6 +621,40 @@ class FactRetriever:
         "which", "while", "who", "whom", "why", "will", "with", "would",
         "you", "your", "yours", "yourself", "yourselves",
     })
+
+    # --- CJK support -------------------------------------------------------
+    # The trigram tokenizer indexes overlapping 3-char windows, so a query
+    # shorter than 3 CJK characters cannot match anything through FTS5
+    # ("芯片" -> 0 hits). CJK detection + a LIKE fallback mirror the
+    # production-proven pattern used by the CLS news database: >=3 char
+    # tokens go through MATCH, shorter ones through substring LIKE.
+    _CJK_RANGES = (
+        (0x4E00, 0x9FFF),    # CJK Unified Ideographs
+        (0x3400, 0x4DBF),    # Extension A
+        (0xF900, 0xFAFF),    # Compatibility Ideographs
+    )
+
+    @classmethod
+    def _has_cjk(cls, text: str) -> bool:
+        if not text:
+            return False
+        return any(
+            any(lo <= ord(ch) <= hi for lo, hi in cls._CJK_RANGES)
+            for ch in text
+        )
+
+    @staticmethod
+    def _split_cjk_run(run: str) -> list[str]:
+        """Split a punctuation-free CJK run into trigram-queryable pieces.
+
+        For runs >=3 chars, a single token works (its 3-char windows overlap
+        the indexed windows). For 2-char runs we keep the pair verbatim —
+        the LIKE fallback handles it. Mixed CJK+latin runs are split so the
+        latin part keeps working through the normal tokenizer.
+        """
+        if len(run) >= 3:
+            return [run]
+        return [run] if run else []
 
     @classmethod
     def _sanitize_fts_query(cls, query: str) -> str:
