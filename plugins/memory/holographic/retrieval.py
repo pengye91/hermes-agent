@@ -553,6 +553,18 @@ class FactRetriever:
         if not rows and self._has_cjk(query):
             rows = self._like_fallback(conn, query, category, min_trust, limit)
 
+        # CJK supplement: a query mixing 3+ char runs with 2-char runs
+        # ("智谱 港股代码") produces a non-empty MATCH result that silently
+        # drops the 2-char signal — merge LIKE hits for those runs into the
+        # candidate pool so the rerank sees them (dedup by fact_id).
+        sub_runs = self._sub_trigram_cjk_runs(query)
+        if sub_runs and self._has_cjk(query):
+            seen = {r["fact_id"] for r in rows}
+            for extra in self._like_fallback_runs(conn, sub_runs, category, min_trust, limit):
+                if extra["fact_id"] not in seen:
+                    rows = list(rows) + [extra]
+                    seen.add(extra["fact_id"])
+
         if not rows:
             return []
 
@@ -623,6 +635,37 @@ class FactRetriever:
             return conn.execute(sql, params).fetchall()
         except Exception:
             return []
+
+    def _like_fallback_runs(
+        self,
+        conn,
+        runs: list[str],
+        category: str | None,
+        min_trust: float,
+        limit: int,
+    ) -> list:
+        """LIKE supplement for explicit 2-char CJK runs. Each run gets its
+        own scan; results are capped per run to keep a common 2-char word
+        from flooding the candidate pool."""
+        out: list = []
+        for run in runs[:4]:  # cap runs considered
+            pattern = f"%{run}%"
+            sql = """
+                SELECT f.*, 0.5 as fts_rank_raw
+                FROM facts f
+                WHERE (f.content LIKE ? ESCAPE '\\' OR f.tags LIKE ? ESCAPE '\\')
+            """
+            params: list = [pattern, pattern]
+            if category:
+                sql += " AND f.category = ?"
+                params.append(category)
+            sql += " AND f.trust_score >= ? ORDER BY f.updated_at DESC LIMIT ?"
+            params.extend([min_trust, max(limit, 10)])
+            try:
+                out.extend(conn.execute(sql, params).fetchall())
+            except Exception:
+                continue
+        return out
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
@@ -715,6 +758,23 @@ class FactRetriever:
         return [run] if run else []
 
     @classmethod
+    def _sub_trigram_cjk_runs(cls, query: str) -> list[str]:
+        """2-char CJK runs in the query — impossible to match through the
+        trigram FTS index, so callers must supplement with LIKE."""
+        runs: list[str] = []
+        current: list[str] = []
+        for ch in query:
+            if cls._is_cjk_char(ch):
+                current.append(ch)
+            else:
+                if len(current) == 2:
+                    runs.append("".join(current))
+                current = []
+        if len(current) == 2:
+            runs.append("".join(current))
+        return runs
+
+    @classmethod
     def _sanitize_fts_query(cls, query: str) -> str:
         """Convert a natural-language query to an FTS5-safe OR expression.
 
@@ -754,12 +814,17 @@ class FactRetriever:
                 cjk_runs.append("".join(current))
 
             shingles: set[str] = set()
+            sub_trigram_runs: list[str] = []
             latin_tokens: list[str] = []
             for run in cjk_runs:
                 if len(run) >= 3:
                     shingles.update(run[i:i+3] for i in range(len(run) - 2))
-                elif len(run) >= 2:
-                    pass  # sub-trigram run: leave for LIKE fallback signal
+                elif len(run) == 2:
+                    # Trigram indexes only 3-char windows, so a 2-char run
+                    # can NEVER match through FTS5 (phrase or bare). It is
+                    # routed to the LIKE supplement in _fts_candidates.
+                    sub_trigram_runs.append(run)
+                # len(run) == 1: single char, too noisy — skip
             # latin/digit tokens in a mixed query still go through the
             # normal phrase-literal path. Keep hyphens: trigram indexes
             # them verbatim and stripping them breaks exact-term recall
