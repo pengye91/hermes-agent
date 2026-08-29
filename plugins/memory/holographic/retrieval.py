@@ -30,10 +30,15 @@ class FactRetriever:
         jaccard_weight: float = 0.3,
         hrr_weight: float = 0.3,
         hrr_dim: int = 1024,
+        vec_weight: float = 0.0,
     ):
         self.store = store
         self.half_life = temporal_decay_half_life
         self.hrr_dim = hrr_dim
+        # Semantic-leg weight in the rerank stage. Default 0 keeps ranking
+        # identical to the lexical-only search; the semantic contribution
+        # still enters via RRF candidate fusion regardless.
+        self.vec_weight = vec_weight
 
         # Auto-redistribute weights if numpy unavailable
         if hrr_weight > 0 and not hrr._HAS_NUMPY:
@@ -52,21 +57,41 @@ class FactRetriever:
         min_trust: float = 0.3,
         limit: int = 10,
     ) -> list[dict]:
-        """Hybrid search: FTS5 candidates → Jaccard rerank → trust weighting.
+        """Hybrid search: lexical + optional semantic via RRF.
 
         Pipeline:
-        1. FTS5 search: Get limit*3 candidates from SQLite full-text search
-        2. Jaccard boost: Token overlap between query and fact content
-        3. Trust weighting: final_score = relevance * trust_score
-        4. Temporal decay (optional): decay = 0.5^(age_days / half_life)
+        1. FTS5 candidates (limit*3) + optional embedding candidates,
+           fused with Reciprocal Rank Fusion (k=60)
+        2. Rerank fused candidates with Jaccard + trust weighting
+        3. Temporal decay (optional)
+
+        When the semantic leg is unavailable (no embedding client, no
+        stored vectors, API failure) RRF degenerates to the lexical
+        ranking — results are identical to the pre-embedding search.
 
         Returns list of dicts with fact data + 'score' field, sorted by score desc.
         """
-        # Stage 1: Get FTS5 candidates (more than limit for reranking headroom)
+        # Stage 1a: lexical candidates
         candidates = self._fts_candidates(query, category, min_trust, limit * 3)
 
-        if not candidates:
+        # Stage 1b: semantic candidates (empty when unavailable)
+        vector_candidates: list[dict] = []
+        if self.store is not None:
+            try:
+                vector_candidates = self.store.vector_candidates(
+                    query, top=limit * 3, category=category
+                )
+            except Exception:
+                vector_candidates = []
+
+        if not candidates and not vector_candidates:
             return []
+
+        # Stage 1c: RRF fusion when both legs produced results
+        if vector_candidates:
+            candidates = self._rrf_fuse(candidates, vector_candidates, top=limit * 3)
+        elif not candidates:
+            candidates = vector_candidates
 
         # Stage 2: Rerank with Jaccard + trust + optional decay
         query_tokens = self._tokenize(query)
@@ -98,10 +123,15 @@ class FactRetriever:
             else:
                 hrr_sim = 0.5  # neutral
 
-            # Combine FTS5 + Jaccard + HRR
+            # Semantic similarity (0 when the fact came from the lexical
+            # leg only — RRF already rewarded dual-leg hits upstream)
+            vsim = fact.get("vsim", 0.0)
+
+            # Combine FTS5 + Jaccard + HRR + semantic
             relevance = (self.fts_weight * fts_score
                         + self.jaccard_weight * jaccard
-                        + self.hrr_weight * hrr_sim)
+                        + self.hrr_weight * hrr_sim
+                        + self.vec_weight * vsim)
 
             # Trust weighting
             score = relevance * fact["trust_score"]
@@ -120,6 +150,34 @@ class FactRetriever:
         for fact in results:
             fact.pop("hrr_vector", None)
         return results
+
+    _RRF_K = 60
+
+    @staticmethod
+    def _rrf_fuse(list_a: list[dict], list_b: list[dict], top: int) -> list[dict]:
+        """Reciprocal Rank Fusion: score = Σ 1/(k + rank). Facts found by
+        both legs stack their contributions and outrank single-leg hits.
+        Fields from both source dicts are merged (vector-side 'vsim',
+        lexical-side 'fts_rank') so the downstream rerank sees every
+        signal regardless of which leg surfaced the fact first."""
+        fused: dict[int, dict] = {}
+        for lst in (list_a, list_b):
+            for rank, fact in enumerate(lst, 1):
+                fid = fact.get("fact_id")
+                if fid is None:
+                    continue
+                if fid in fused:
+                    entry = fused[fid]
+                    for k, v in fact.items():
+                        if k != "rrf_score":
+                            entry.setdefault(k, v)
+                else:
+                    entry = dict(fact)
+                    fused[fid] = entry
+                entry.setdefault("rrf_score", 0.0)
+                entry["rrf_score"] += 1.0 / (FactRetriever._RRF_K + rank)
+        out = sorted(fused.values(), key=lambda f: -f.get("rrf_score", 0.0))
+        return out[:top]
 
     def probe(
         self,

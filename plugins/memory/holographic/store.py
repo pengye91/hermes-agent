@@ -122,6 +122,7 @@ class MemoryStore:
         db_path: "str | Path | None" = None,
         default_trust: float = 0.5,
         hrr_dim: int = 1024,
+        embedding_client=None,
     ) -> None:
         if db_path is None:
             from hermes_constants import get_hermes_home
@@ -131,6 +132,9 @@ class MemoryStore:
         self.default_trust = _clamp_trust(default_trust)
         self.hrr_dim = hrr_dim
         self._hrr_available = hrr._HAS_NUMPY
+        # Optional semantic leg. Any object exposing .available and
+        # .embed(texts) works; None keeps the store purely lexical.
+        self._embed_client = embedding_client
 
         # Acquire (or open) the process-wide shared connection for this DB.
         # resolve() (not just expanduser) so symlinked/relative paths to the
@@ -183,6 +187,11 @@ class MemoryStore:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
+        if "embedding" not in columns:
+            # Optional semantic leg (512-dim float32 BLOB, ~2KB/fact).
+            # Populated asynchronously by _compute_embedding when an
+            # embedding client is configured; NULL for legacy rows.
+            self._conn.execute("ALTER TABLE facts ADD COLUMN embedding BLOB")
         # Migrate: legacy facts_fts used external-content mode (content=facts)
         # with the default unicode61 tokenizer — CJK text was unindexed and
         # the external-content table can silently return 0 rows under
@@ -255,6 +264,8 @@ class MemoryStore:
 
             # Compute HRR vector after entity linking
             self._compute_hrr_vector(fact_id, content)
+            # Semantic vector (no-op without an embedding client)
+            self._compute_embedding(fact_id, content)
             self._rebuild_bank(category)
 
             return fact_id
@@ -593,6 +604,103 @@ class MemoryStore:
                 (hrr.phases_to_bytes(vector), fact_id),
             )
             self._conn.commit()
+
+    def _compute_embedding(self, fact_id: int, content: str) -> None:
+        """Embed one fact for the semantic retrieval leg. No-op when the
+        embedding client is missing or the call fails — lexical retrieval
+        continues to work untouched (graceful degradation by design)."""
+        if self._embed_client is None or not getattr(self._embed_client, "available", False):
+            return
+        try:
+            from . import embedding as emb
+        except ImportError:
+            import embedding as emb  # type: ignore[no-redef]
+
+        with self._lock:
+            vec = self._embed_client.embed([content])
+            if not vec:
+                return
+            self._conn.execute(
+                "UPDATE facts SET embedding = ? WHERE fact_id = ?",
+                (emb.pack_vector(vec[0]), fact_id),
+            )
+            self._conn.commit()
+
+    def backfill_embeddings(self, batch_size: int = 16, max_batches: int | None = None) -> int:
+        """Embed facts whose embedding column is NULL. Idempotent; returns
+        the number of facts embedded this run. Failure of a batch just stops
+        the run — already-written vectors stay, the next call resumes."""
+        if self._embed_client is None or not getattr(self._embed_client, "available", False):
+            return 0
+        try:
+            from . import embedding as emb
+        except ImportError:
+            import embedding as emb  # type: ignore[no-redef]
+
+        done = 0
+        with self._lock:
+            batches = 0
+            while max_batches is None or batches < max_batches:
+                rows = self._conn.execute(
+                    "SELECT fact_id, content FROM facts "
+                    "WHERE embedding IS NULL AND COALESCE(content,'') != '' "
+                    "ORDER BY fact_id LIMIT ?",
+                    (batch_size,),
+                ).fetchall()
+                if not rows:
+                    break
+                vecs = self._embed_client.embed([r["content"] for r in rows])
+                if not vecs:
+                    break  # API down — resume next call
+                for r, v in zip(rows, vecs):
+                    self._conn.execute(
+                        "UPDATE facts SET embedding = ? WHERE fact_id = ?",
+                        (emb.pack_vector(v), r["fact_id"]),
+                    )
+                self._conn.commit()
+                done += len(rows)
+                batches += 1
+        return done
+
+    def vector_candidates(
+        self, query: str, top: int = 30, category: str | None = None
+    ) -> list[dict]:
+        """Semantic retrieval: embed the query once, brute-force cosine over
+        stored fact embeddings. Returns [] when unavailable (no client, no
+        vectors, or API failure) so callers fall back to lexical only."""
+        if self._embed_client is None or not getattr(self._embed_client, "available", False):
+            return []
+        try:
+            from . import embedding as emb
+        except ImportError:
+            import embedding as emb  # type: ignore[no-redef]
+
+        with self._lock:
+            where = "WHERE embedding IS NOT NULL"
+            params: list = []
+            if category:
+                where += " AND category = ?"
+                params.append(category)
+            rows = self._conn.execute(
+                f"SELECT fact_id, content, category, tags, trust_score, "
+                f"retrieval_count, helpful_count, created_at, updated_at, embedding "
+                f"FROM facts {where}",
+                params,
+            ).fetchall()
+        if not rows:
+            return []
+
+        qv = self._embed_client.embed([query])
+        if not qv:
+            return []
+
+        scored = []
+        for r in rows:
+            fact = dict(r)
+            blob = fact.pop("embedding")
+            scored.append((emb.cosine(qv[0], emb.unpack_vector(blob)), fact))
+        scored.sort(key=lambda t: -t[0])
+        return [dict(f, vsim=s) for s, f in scored[:top]]
 
     def _rebuild_bank(self, category: str) -> None:
         """Full rebuild of a category's memory bank from all its fact vectors."""

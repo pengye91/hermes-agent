@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, List
 
@@ -168,15 +169,61 @@ class HolographicMemoryProvider(MemoryProvider):
         hrr_dim = int(self._config.get("hrr_dim", 1024))
         hrr_weight = float(self._config.get("hrr_weight", 0.3))
         temporal_decay = int(self._config.get("temporal_decay_half_life", 0))
+        vec_weight = float(self._config.get("vec_weight", 0.25))
 
-        self._store = MemoryStore(db_path=db_path, default_trust=default_trust, hrr_dim=hrr_dim)
+        # Optional semantic leg: constructed only when an API key resolves.
+        # No key → client.available is False → store stays purely lexical.
+        self._embed_client = None
+        if is_truthy_value(self._config.get("semantic_enabled", True)):
+            try:
+                from .embedding import EmbeddingClient
+            except ImportError:
+                from embedding import EmbeddingClient  # type: ignore[no-redef]
+
+            # Load ~/.hermes/.env so provider keys resolve exactly like the
+            # rest of Hermes (secrets never live in config.yaml).
+            from pathlib import Path as _P
+            _env_path = _P(_hermes_home) / ".env"
+            if _env_path.exists():
+                try:
+                    from .embedding import load_env_file
+                except ImportError:
+                    from embedding import load_env_file  # type: ignore[no-redef]
+                for _k, _v in load_env_file(_env_path).items():
+                    os.environ.setdefault(_k, _v)
+
+            self._embed_client = EmbeddingClient(
+                base_url=self._config.get("embedding_base_url"),
+                model=self._config.get("embedding_model"),
+                dimensions=int(self._config.get("embedding_dim", 512)),
+                api_key_env=self._config.get("embedding_key_env"),
+            )
+            if not self._embed_client.available:
+                self._embed_client = None
+
+        self._store = MemoryStore(
+            db_path=db_path,
+            default_trust=default_trust,
+            hrr_dim=hrr_dim,
+            embedding_client=self._embed_client,
+        )
         self._retriever = FactRetriever(
             store=self._store,
             temporal_decay_half_life=temporal_decay,
             hrr_weight=hrr_weight,
             hrr_dim=hrr_dim,
+            vec_weight=vec_weight,
         )
         self._session_id = session_id
+
+        # Opportunistic backfill: embed legacy facts a few batches per
+        # session start. Keeps startup fast while gradually converging the
+        # corpus to full semantic coverage (idempotent, resumable).
+        if self._embed_client is not None:
+            try:
+                self._store.backfill_embeddings(batch_size=16, max_batches=2)
+            except Exception as e:
+                logger.debug("embedding backfill skipped: %s", e)
 
     def system_prompt_block(self) -> str:
         if not self._store:
