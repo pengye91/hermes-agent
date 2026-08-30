@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS facts (
     helpful_count   INTEGER DEFAULT 0,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    hrr_vector      BLOB
+    hrr_vector      BLOB,
+    msg_id          INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS entities (
@@ -253,6 +254,11 @@ class MemoryStore:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
+        # Migrate: add msg_id (provenance) column if missing — the 2026-08-29
+        # double-distill incident's blind spot: facts could not be traced
+        # back to source messages.
+        if "msg_id" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN msg_id INTEGER")
         if "embedding" not in columns:
             # Optional semantic leg (512-dim float32 BLOB, ~2KB/fact).
             # Populated asynchronously by _compute_embedding when an
@@ -294,11 +300,14 @@ class MemoryStore:
         content: str,
         category: str = "general",
         tags: str = "",
+        msg_id: "int | None" = None,
     ) -> int:
         """Insert a fact and return its fact_id.
 
         Deduplicates by content (UNIQUE constraint). On duplicate, returns
-        the existing fact_id without modifying the row. Extracts entities from
+        the existing fact_id; if the duplicate call carries msg_id and the
+        existing row lacks it, the provenance is backfilled (first
+        provenance wins — never overwritten). Extracts entities from
         the content and links them to the fact.
         """
         with self._lock:
@@ -309,18 +318,25 @@ class MemoryStore:
             try:
                 cur = self._conn.execute(
                     """
-                    INSERT INTO facts (content, category, tags, trust_score)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO facts (content, category, tags, trust_score, msg_id)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
-                    (content, category, tags, self.default_trust),
+                    (content, category, tags, self.default_trust, msg_id),
                 )
                 self._conn.commit()
                 fact_id: int = cur.lastrowid  # type: ignore[assignment]
             except sqlite3.IntegrityError:
-                # Duplicate content — return existing id
+                # Duplicate content — return existing id; backfill missing
+                # provenance (first wins, never overwritten).
                 row = self._conn.execute(
-                    "SELECT fact_id FROM facts WHERE content = ?", (content,)
+                    "SELECT fact_id, msg_id FROM facts WHERE content = ?", (content,)
                 ).fetchone()
+                if msg_id is not None and row["msg_id"] is None:
+                    self._conn.execute(
+                        "UPDATE facts SET msg_id = ? WHERE fact_id = ?",
+                        (msg_id, row["fact_id"]),
+                    )
+                    self._conn.commit()
                 return int(row["fact_id"])
 
             # Entity extraction and linking
