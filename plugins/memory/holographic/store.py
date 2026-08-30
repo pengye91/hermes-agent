@@ -87,12 +87,65 @@ _RE_AKA          = re.compile(
     r'(\w+(?:\s+\w+)*)\s+(?:aka|also known as)\s+(\w+(?:\s+\w+)*)',
     re.IGNORECASE,
 )
+
+# Generic business/grammar words that must never become entities.
+# Curated from the 2026-08-30 entity-graph audit of the production store:
+# the top ~60 2-char CJK entities by link count were ALL generic words
+# (结论 593, 新增 518, 止损 377, …) while real 2-char companies sat far
+# below (腾讯 #75, 智谱 #176). Frequency-based deletion would kill the
+# real ones; this list is the audited alternative.
+_ENTITY_STOPWORDS = frozenset({
+    # audit top offenders (link-count desc)
+    "结论", "新增", "止损", "营收", "净利", "字段", "修复", "导致", "亿元",
+    "减仓", "而非", "分钟", "返回", "改为", "现价", "调用", "标的", "通过",
+    "数据", "模式", "待办", "浮盈", "当前", "不是", "参数", "信号", "买入",
+    "验证", "量比", "使用", "任务", "算力", "板块", "市值", "权重", "评分",
+    "全部", "涨停", "阈值", "覆盖", "更新", "文件", "函数", "仓位", "成本",
+    "触发", "格式", "删除", "路径", "确认", "新闻", "完成", "决策", "问题",
+    "方案",
+    # grammar glue (same shape as the offenders; added at curation)
+    "关于", "说明", "显示", "我们", "当时", "投资", "公司", "业务", "讨论",
+    "这个", "那个", "还是", "以及", "今天", "昨天", "明天", "如果", "因为",
+    "但是", "然后", "所以", "并且", "或者", "一个", "这种", "每个",
+    "可以", "需要", "应该", "就是", "只有", "还有", "已经", "正在", "状态",
+    "继续", "开始", "结束", "进行", "出来", "进去", "上去", "下来",
+})
+
+# Single grammar glue chars that segment long CJK runs. Chinese has no
+# spaces; a 9+ char run exceeds the entity cap and is dropped WHOLE,
+# swallowing mid-sentence names (the original 百合花 recall lesson).
+# Splitting on function words recovers 智谱 from 今天讨论智谱的估值.
+# Deliberately EXCLUDES chars common inside real names (用/有/无/为/新/大).
+_ENTITY_GLUE_CHARS = frozenset("的了吗呢吧啊与和或者是在对于从被把给向着过将已也都还又再很太最更至让不")
+
+# Segmentation pattern: stopword substrings (longest-first) + glue chars,
+# used to split over-long CJK runs at function-word boundaries.
+_ENTITY_SPLIT_RE = re.compile(
+    "|".join(map(re.escape, sorted(_ENTITY_STOPWORDS | _ENTITY_GLUE_CHARS,
+                                   key=len, reverse=True))))
+
+# [L|yymmdd] / [L|yymmdd|主体] distillation headers: keep the subject
+# entity, drop the date (18.5% of entity links in the 2026-08-30 audit
+# were date stamps eaten by the ticker regex).
+_RE_HEADER = re.compile(r"^\s*\[L\|(\d{6})(?:\|([^\]]*))?\]\s*")
 # CJK runs (Unified Ideographs + Ext-A), later filtered to 2-8 chars
 _RE_CJK_RUN      = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf]+')
-# CamelCase tech tokens with an internal case boundary: MiniMax/OpenClaw/DuckDB
-_RE_CAMEL_TOKEN  = re.compile(r'\b[A-Za-z][a-z]+[A-Z][A-Za-z]+\b')
-# Ticker-style codes: 688507 / 2513.HK / 002222.SZ / sh600895
-_RE_TICKER       = re.compile(r'\b(?:\d{6}|[A-Za-z]{2}\d{6}|\d{3,5}\.(?:HK|SZ|SH))\b')
+# CamelCase tech tokens with an internal case boundary: MiniMax/OpenClaw/DuckDB.
+# Lookarounds instead of \b: CJK chars are also \w in Python re, so \b never
+# fires between 对 and M in "对MiniMax的关键判断" — unspaced mixed runs need
+# the boundary asserted only against OTHER latin letters.
+_RE_CAMEL_TOKEN  = re.compile(
+    r'(?<![A-Za-z])[A-Za-z][a-z]+[A-Z][A-Za-z]+(?![A-Za-z])')
+# Ticker-style codes: bare 6-digit A-share codes (688507 / 002222 /
+# 301421 / 600895 / 000063 …), exchange-prefixed (sh600895), and
+# suffix forms (2513.HK / 002222.SZ). Bare 6-digit DATE stamps (260628
+# = yymmdd from the [L|…] header, or 251231) must NOT match: anchor the
+# bare form to real A-share board prefixes (60/68/00/30/8/4/9).
+_RE_TICKER       = re.compile(
+    r'\b(?:(?:6[08]\d{4}|00\d{4}|30\d{4}|[849]\d{5})'  # bare A-share
+    r'|[A-Za-z]{2}\d{6}'                               # sh600895 style
+    r'|\d{3,5}\.(?:HK|SZ|SH))\b'                       # 2513.HK style
+)
 
 
 def _clamp_trust(value: float) -> float:
@@ -532,6 +585,16 @@ class MemoryStore:
                 seen.add(stripped.lower())
                 candidates.append(stripped)
 
+        # Distillation headers carry the date + subject entity: keep the
+        # subject as a candidate, never the date (audit: 18.5% junk links
+        # were date stamps eaten by the ticker regex).
+        m = _RE_HEADER.match(text or "")
+        if m and m.group(2):
+            _add(m.group(2))
+            text = _RE_HEADER.sub("", text, count=1)
+        elif m:
+            text = _RE_HEADER.sub("", text, count=1)
+
         for m in _RE_CAPITALIZED.finditer(text):
             _add(m.group(1))
 
@@ -551,16 +614,27 @@ class MemoryStore:
         # prose sentences are filtered by the length cap.
         for m in _RE_CJK_RUN.finditer(text):
             run = m.group(0)
-            if 2 <= len(run) <= 8:
-                _add(run)
+            if len(run) < 2:
+                continue
+            if len(run) <= 8:
+                if run not in _ENTITY_STOPWORDS:
+                    _add(run)
+                continue
+            # Over-long glued run (Chinese has no spaces): split at
+            # function-word boundaries and keep 2-8 char sub-runs. This
+            # recovers mid-sentence names (今天讨论智谱的估值 → 智谱)
+            # that the whole-run cap used to swallow.
+            for piece in _ENTITY_SPLIT_RE.split(run):
+                piece = piece.strip()
+                if 2 <= len(piece) <= 8 and piece not in _ENTITY_STOPWORDS:
+                    _add(piece)
 
-        # CamelCase tokens (MiniMax, DuckDB, OpenClaw): single capitalized
-        # words are skipped by rule 1 (which needs two words), yet these
-        # are exactly the product/company names worth probing.
         for m in _RE_CAMEL_TOKEN.finditer(text):
             _add(m.group(0))
 
-        # Ticker-style codes: bare 6-digit (688507), suffixed (.HK/.SZ/.SH)
+        # Ticker-style codes: bare 6-digit A-share codes (688507 / 002222 /
+        # 301421 / 600895 / 000063 …), exchange-prefixed (sh600895), and
+        # suffix forms (2513.HK / 002222.SZ). Date stamps must NOT match.
         for m in _RE_TICKER.finditer(text):
             _add(m.group(0))
 
