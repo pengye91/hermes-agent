@@ -123,6 +123,7 @@ class MemoryStore:
         default_trust: float = 0.5,
         hrr_dim: int = 1024,
         embedding_client=None,
+        _vec_cache_max_facts: int = 50000,
     ) -> None:
         if db_path is None:
             from hermes_constants import get_hermes_home
@@ -135,6 +136,18 @@ class MemoryStore:
         # Optional semantic leg. Any object exposing .available and
         # .embed(texts) works; None keeps the store purely lexical.
         self._embed_client = embedding_client
+
+        # In-process embedding matrix cache (Fix 2026-08-30): the semantic
+        # leg used to re-fetch every embedding blob per query (O(n) SQL +
+        # Python unpack, 3-7s at 27k facts). Cache the normalized matrix in
+        # RAM (50k facts x 512d float32 = ~100MB cap) and serve queries as
+        # a single matmul. Invalidated by any fact mutation.
+        self._vec_cache_max_facts = _vec_cache_max_facts
+        self._vec_matrix = None          # np.ndarray (n, d), L2-normalized
+        self._vec_ids = None             # list[int] fact_ids aligned to rows
+        self._vec_cache_stats = {"builds": 0, "hits": 0, "capped": False}
+        # alias for readability at call sites
+        self._vec_stats = self._vec_cache_stats
 
         # Acquire (or open) the process-wide shared connection for this DB.
         # resolve() (not just expanduser) so symlinked/relative paths to the
@@ -258,6 +271,7 @@ class MemoryStore:
                 return int(row["fact_id"])
 
             # Entity extraction and linking
+            self._invalidate_vec_cache()
             for name in self._extract_entities(content):
                 entity_id = self._resolve_entity(name)
                 self._link_fact_entity(fact_id, entity_id)
@@ -370,6 +384,10 @@ class MemoryStore:
                 params,
             )
             self._conn.commit()
+            if content is not None:
+                # Content change → new embedding will be computed below and
+                # the matrix row set changes shape — invalidate the cache.
+                self._invalidate_vec_cache()
 
             # If content changed, re-extract entities
             if content is not None:
@@ -384,6 +402,13 @@ class MemoryStore:
             # Recompute HRR vector if content changed
             if content is not None:
                 self._compute_hrr_vector(fact_id, content)
+                # Recompute embedding too — a content change with a stale
+                # vector silently poisons the semantic leg (the row keeps
+                # matching the OLD text forever).
+                try:
+                    self._compute_embedding(fact_id, content)
+                except Exception:
+                    pass
             # Rebuild bank for relevant category
             cat = category or self._conn.execute(
                 "SELECT category FROM facts WHERE fact_id = ?", (fact_id,)
@@ -406,6 +431,7 @@ class MemoryStore:
             )
             self._conn.execute("DELETE FROM facts WHERE fact_id = ?", (fact_id,))
             self._conn.commit()
+            self._invalidate_vec_cache()
             self._rebuild_bank(row["category"])
             return True
 
@@ -662,12 +688,53 @@ class MemoryStore:
                 batches += 1
         return done
 
+    def _invalidate_vec_cache(self) -> None:
+        """Fact mutation happened — next query rebuilds the matrix."""
+        self._vec_matrix = None
+        self._vec_ids = None
+
+    def _build_vec_cache(self) -> bool:
+        """Load all embeddings into one normalized numpy matrix. Returns True
+        if the cache is usable (False → caller falls back to row-wise path)."""
+        if not hrr._HAS_NUMPY or self._embed_client is None:
+            return False
+        import numpy as np
+        with self._lock:
+            n_total = self._conn.execute(
+                "SELECT COUNT(*) FROM facts WHERE embedding IS NOT NULL"
+            ).fetchone()[0]
+            self._vec_stats["capped"] = n_total > self._vec_cache_max_facts
+            if self._vec_stats["capped"]:
+                return False
+            rows = self._conn.execute(
+                "SELECT fact_id, embedding FROM facts WHERE embedding IS NOT NULL"
+            ).fetchall()
+        if not rows:
+            return False
+        ids = [r["fact_id"] for r in rows]
+        dim = len(rows[0]["embedding"]) // 4  # float32 blobs
+        mat = np.empty((len(rows), dim), dtype=np.float32)
+        for i, r in enumerate(rows):
+            mat[i] = np.frombuffer(r["embedding"], dtype=np.float32)
+        norms = np.linalg.norm(mat, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        self._vec_matrix = mat / norms
+        self._vec_ids = ids
+        self._vec_stats["builds"] += 1
+        return True
+
     def vector_candidates(
         self, query: str, top: int = 30, category: str | None = None
     ) -> list[dict]:
-        """Semantic retrieval: embed the query once, brute-force cosine over
-        stored fact embeddings. Returns [] when unavailable (no client, no
-        vectors, or API failure) so callers fall back to lexical only."""
+        """Semantic retrieval: embed the query once, cosine over stored fact
+        embeddings. Returns [] when unavailable (no client, no vectors, or
+        API failure) so callers fall back to lexical only.
+
+        2026-08-30: serves from the in-RAM normalized matrix (one matmul per
+        query) instead of re-fetching every blob per query. Falls back to the
+        original row-wise path when numpy is missing or the store exceeds the
+        cache capacity cap. The matrix is category-agnostic; category
+        filtering is post-hoc (correct; curated tiers are small)."""
         if self._embed_client is None or not getattr(self._embed_client, "available", False):
             return []
         try:
@@ -675,32 +742,71 @@ class MemoryStore:
         except ImportError:
             import embedding as emb  # type: ignore[no-redef]
 
-        with self._lock:
-            where = "WHERE embedding IS NOT NULL"
-            params: list = []
-            if category:
-                where += " AND category = ?"
-                params.append(category)
-            rows = self._conn.execute(
-                f"SELECT fact_id, content, category, tags, trust_score, "
-                f"retrieval_count, helpful_count, created_at, updated_at, embedding "
-                f"FROM facts {where}",
-                params,
-            ).fetchall()
-        if not rows:
-            return []
+        if self._vec_matrix is None and not self._build_vec_cache():
+            # Cache unavailable → original row-wise path, unchanged behavior
+            with self._lock:
+                where = "WHERE embedding IS NOT NULL"
+                params: list = []
+                if category:
+                    where += " AND category = ?"
+                    params.append(category)
+                rows = self._conn.execute(
+                    f"SELECT fact_id, content, category, tags, trust_score, "
+                    f"retrieval_count, helpful_count, created_at, updated_at, embedding "
+                    f"FROM facts {where}",
+                    params,
+                ).fetchall()
+            if not rows:
+                return []
+            qv = self._embed_client.embed([query])
+            if not qv:
+                return []
+            scored = []
+            for r in rows:
+                fact = dict(r)
+                blob = fact.pop("embedding")
+                scored.append((emb.cosine(qv[0], emb.unpack_vector(blob)), fact))
+            scored.sort(key=lambda t: -t[0])
+            return [dict(f, vsim=s) for s, f in scored[:top]]
 
+        # Matrix path
+        import numpy as np
+        matrix = self._vec_matrix
+        ids = self._vec_ids
+        if matrix is None or ids is None:  # pragma: no cover - build just failed
+            return []
         qv = self._embed_client.embed([query])
         if not qv:
             return []
-
-        scored = []
-        for r in rows:
-            fact = dict(r)
-            blob = fact.pop("embedding")
-            scored.append((emb.cosine(qv[0], emb.unpack_vector(blob)), fact))
-        scored.sort(key=lambda t: -t[0])
-        return [dict(f, vsim=s) for s, f in scored[:top]]
+        q = np.asarray(qv[0], dtype=np.float32)
+        qn = np.linalg.norm(q)
+        if qn == 0:
+            return []
+        q = q / qn
+        sims = matrix @ q  # (n,)
+        order = np.argsort(-sims)[: top * 4]  # overfetch for category filter
+        if not order.size:
+            return []
+        wanted = [int(ids[i]) for i in order]
+        ph = ",".join("?" * len(wanted))
+        rows = self._conn.execute(
+            f"SELECT fact_id, content, category, tags, trust_score, "
+            f"retrieval_count, helpful_count, created_at, updated_at "
+            f"FROM facts WHERE fact_id IN ({ph})", wanted).fetchall()
+        by_id = {r["fact_id"]: dict(r) for r in rows}
+        out = []
+        for i in order:
+            fid = int(ids[i])
+            f = by_id.get(fid)
+            if f is None:
+                continue
+            if category and f.get("category") != category:
+                continue
+            out.append(dict(f, vsim=float(sims[i])))
+            if len(out) >= top:
+                break
+        self._vec_stats["hits"] += 1
+        return out
 
     def _rebuild_bank(self, category: str) -> None:
         """Full rebuild of a category's memory bank from all its fact vectors."""
