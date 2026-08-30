@@ -70,6 +70,11 @@ FACT_STORE_SCHEMA = {
             "trust_delta": {"type": "number", "description": "Trust adjustment for 'update'."},
             "min_trust": {"type": "number", "description": "Minimum trust filter (default: 0.3)."},
             "limit": {"type": "integer", "description": "Max results (default: 10)."},
+            "rerank": {"type": "string", "enum": ["off", "llm"],
+                       "description": ("search only: 'llm' adds a listwise LLM rerank on the "
+                                       "top candidates — use for judgment queries like "
+                                       "'我们当时对X的结论' (~2s; silently keeps statistical "
+                                       "order on failure). Default 'off'.")},
         },
         "required": ["action"],
     },
@@ -414,11 +419,22 @@ class HolographicMemoryProvider(MemoryProvider):
                 return json.dumps({"fact_id": fact_id, "status": "added"})
 
             elif action == "search":
-                results = retriever.search(
+                # rerank='llm' (opt-in) adds a listwise LLM stage on top of
+                # the statistical ranking — judgment queries ("对X的结论")
+                # separate conclusions from evidence. Default 'off'.
+                from .llm_rerank import rerank_search, _RerankClient
+                _ret = retriever  # non-None when handlers run (store bound)
+                results = rerank_search(
+                    lambda q, lim: _ret.search(
+                        q,
+                        category=args.get("category"),
+                        min_trust=float(args.get("min_trust", self._min_trust)),
+                        limit=lim,
+                    ),
                     args["query"],
-                    category=args.get("category"),
-                    min_trust=float(args.get("min_trust", self._min_trust)),
-                    limit=int(args.get("limit", 10)),
+                    _RerankClient(),
+                    rerank=str(args.get("rerank", "off")),
+                    k=int(args.get("limit", 10)),
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
