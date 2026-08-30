@@ -64,6 +64,16 @@ def test_boilerplate_strip_all_boilerplate():
     assert llm_rerank._boilerplate_strip("我们当时讨论过什么") == ""
 
 
+def test_mixed_unseparated_latin_survives_sanitize():
+    """REGRESSION (2026-08-30 benchmark): 无空格中拉混排 'MiniMax的港股代码'
+    的拉丁 token 必须进 FTS 查询——空格分词永远看不到它。"""
+    from plugins.memory.holographic.retrieval import FactRetriever
+    q = FactRetriever._sanitize_fts_query("MiniMax的港股代码")
+    assert '"MiniMax"' in q
+    # CJK shingles 仍在
+    assert '"的港股"' in q or '"股代码"' in q
+
+
 def test_parse_llm_picks_garbage():
     assert llm_rerank._parse_picks("我觉得都不相关") == []
     assert llm_rerank._parse_picks("") == []

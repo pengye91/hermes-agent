@@ -848,12 +848,22 @@ class FactRetriever:
             # normal phrase-literal path. Keep hyphens: trigram indexes
             # them verbatim and stripping them breaks exact-term recall
             # ("daemon-reexec" -> "daemonreexec" matches nothing).
-            for raw in query.split():
+            # Unseparated mixed runs ("MiniMax的港股代码") must be split
+            # on CJK boundaries too — query.split() alone never sees the
+            # latin token when no whitespace separates it from the CJK
+            # text (2026-08-30 benchmark MISS root cause: the company
+            # name was the ONLY strong signal and it was dropped).
+            import re as _re
+            latin_pieces = list(query.split()) + _re.split(
+                r"[\u4e00-\u9fff]+", query)
+            for raw in latin_pieces:
                 cleaned = raw.strip(".,;:!?\"'()[]{}#@<>").translate(
                     str.maketrans("", "", '"()*^:+'))
                 if len(cleaned) >= 2 and cleaned not in cls._FTS_STOPWORDS \
                         and not cls._has_cjk(cleaned):
-                    latin_tokens.append(f'"{cleaned}"')
+                    token = f'"{cleaned}"'
+                    if token not in latin_tokens:
+                        latin_tokens.append(token)
 
             or_parts = [f'"{s}"' for s in shingles] + latin_tokens
             if or_parts:
