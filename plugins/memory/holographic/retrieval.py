@@ -24,13 +24,13 @@ class FactRetriever:
 
     def __init__(
         self,
-        store: MemoryStore,
+        store: "MemoryStore | None",
         temporal_decay_half_life: int = 0,  # days, 0 = disabled
-        fts_weight: float = 0.4,
-        jaccard_weight: float = 0.3,
-        hrr_weight: float = 0.3,
+        fts_weight: float = 0.45,
+        jaccard_weight: float = 0.30,
+        hrr_weight: float = 0.10,
         hrr_dim: int = 1024,
-        vec_weight: float = 0.0,
+        vec_weight: float = 0.15,
     ):
         self.store = store
         self.half_life = temporal_decay_half_life
@@ -39,6 +39,18 @@ class FactRetriever:
         # identical to the lexical-only search; the semantic contribution
         # still enters via RRF candidate fusion regardless.
         self.vec_weight = vec_weight
+
+        # 2026-08-30 Fix #2: hrr demoted 0.3 → 0.1 (SNR=0.15 at 27k facts is
+        # noise-dominated; dim≥4n≈108k to recover is infeasible) and weights
+        # renormalized to sum 1.0 (was 1.25 — ranking within a query was fine
+        # but scores were not comparable across queries). Explicit args are
+        # honored as-is: the caller owns normalization in that case.
+        _total = fts_weight + jaccard_weight + hrr_weight + vec_weight
+        if _total > 0 and abs(_total - 1.0) > 1e-9:
+            fts_weight /= _total
+            jaccard_weight /= _total
+            hrr_weight /= _total
+            vec_weight /= _total
 
         # Auto-redistribute weights if numpy unavailable
         if hrr_weight > 0 and not hrr._HAS_NUMPY:
