@@ -165,6 +165,9 @@ def test_search_results_bit_identical_to_unhoisted(hoisted_retriever):
 
     Replicates the pre-fix loop (query vector encoded per candidate) as the
     reference and compares full scored output for exact equality.
+    retrieval_count is excluded: search() now (2026-08-30) increments it
+    as best-effort retrieval telemetry, which is orthogonal to ranking
+    parity.
     """
     r = hoisted_retriever
     query = "deploy target setting"
@@ -196,6 +199,12 @@ def test_search_results_bit_identical_to_unhoisted(hoisted_retriever):
     for fact in old_results:
         fact.pop("hrr_vector", None)
         fact.pop("embedding", None)  # search() strips binary cols; parity on scoring/ranking
+        fact.pop("retrieval_count", None)  # best-effort telemetry, not ranking
+
+    # search() increments retrieval_count per surfaced fact (2026-08-30
+    # learning-loop wiring) — exclude it from ranking parity.
+    for fact in new_results:
+        fact.pop("retrieval_count", None)
 
     assert new_results == old_results
 

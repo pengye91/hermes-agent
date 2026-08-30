@@ -62,6 +62,27 @@ class FactRetriever:
         self.jaccard_weight = jaccard_weight
         self.hrr_weight = hrr_weight
 
+    def _note_retrieved(self, facts: list[dict]) -> None:
+        """Best-effort retrieval_count increment for surfaced facts.
+
+        The learning loop (trust feedback) is blind without traffic data;
+        the main search path never counted (audit 2026-08-30: 10/27,493
+        facts had retrieval_count>0). Counter failure must NEVER break
+        the search itself — metrics are best-effort.
+        """
+        ids = [f.get("fact_id") for f in facts if f.get("fact_id") is not None]
+        if not ids or self.store is None:
+            return
+        try:
+            ph = ",".join("?" * len(ids))
+            with self.store._lock:
+                self.store._conn.execute(
+                    f"UPDATE facts SET retrieval_count = retrieval_count + 1 "
+                    f"WHERE fact_id IN ({ph})", ids)
+                self.store._conn.commit()
+        except Exception:
+            pass
+
     def search(
         self,
         query: str,
@@ -165,6 +186,7 @@ class FactRetriever:
         for fact in results:
             fact.pop("hrr_vector", None)
             fact.pop("embedding", None)
+        self._note_retrieved(results)
         return results
 
     _RRF_K = 60
@@ -257,6 +279,7 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
+        self._note_retrieved(scored[:limit])
         return scored[:limit]
 
     def related(
