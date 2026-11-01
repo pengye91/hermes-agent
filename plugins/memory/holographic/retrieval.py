@@ -7,6 +7,7 @@ Jaccard similarity reranking and trust-weighted scoring.
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -17,6 +18,15 @@ try:
     from . import holographic as hrr
 except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
+
+
+# Code-shape tokens: stock codes, versions, IDs — strong discriminators
+# kept whole rather than trigram-fragmented.
+_CODE_TOKEN = re.compile(
+    r"^[a-z]?[0-9]{3,6}(\.[a-z]{1,4})?$"      # 688502, 2513.hk, 06809.hk
+    r"|^v?\d+\.\d+(\.\d+)*$"                   # 1.9, v1.9.0, 2.0.0
+    r"|^[a-z]+\d{2,}$"                          # gpt4, mp3
+)
 
 
 class FactRetriever:
@@ -107,24 +117,44 @@ class FactRetriever:
         # Stage 1a: lexical candidates
         candidates = self._fts_candidates(query, category, min_trust, limit * 3)
 
-        # Stage 1b: semantic candidates (empty when unavailable)
+        # Stage 1b: semantic candidates (empty when unavailable).
+        # The query is boilerplate-stripped BEFORE embedding — conversational
+        # filler ('我们当时对X的结论是什么') dilutes the vector and buries the
+        # subject (cycle C, same lesson the smart path already applies).
         vector_candidates: list[dict] = []
         if self.store is not None:
             try:
+                from .llm_rerank import _boilerplate_strip
+                vec_query = _boilerplate_strip(query).strip() or query
                 vector_candidates = self.store.vector_candidates(
-                    query, top=limit * 3, category=category
+                    vec_query, top=limit * 3, category=category
                 )
             except Exception:
                 vector_candidates = []
 
-        if not candidates and not vector_candidates:
+        # Stage 1b': jieba word-level leg (cycle D) — fused via RRF with a
+        # small weight. Additive: missing table / missing jieba → empty
+        # list, identical behaviour to the two-leg search.
+        jieba_candidates_list: list[dict] = []
+        try:
+            from .jieba_leg import jieba_candidates as _jieba_cands
+            jieba_candidates_list = _jieba_cands(
+                self.store, query, top=limit)
+        except Exception:
+            jieba_candidates_list = []
+
+        if not candidates and not vector_candidates and not jieba_candidates_list:
             return []
 
-        # Stage 1c: RRF fusion when both legs produced results
-        if vector_candidates:
+        # Stage 1c: RRF fusion when legs produced results
+        if vector_candidates and candidates:
             candidates = self._rrf_fuse(candidates, vector_candidates, top=limit * 3)
         elif not candidates:
             candidates = vector_candidates
+        if jieba_candidates_list:
+            candidates = self._rrf_fuse(
+                (candidates or jieba_candidates_list),
+                jieba_candidates_list, top=limit * 3)
 
         # Stage 2: Rerank with Jaccard + trust + optional decay
         query_tokens = self._tokenize(query)
@@ -837,9 +867,16 @@ class FactRetriever:
 
         If nothing remains (pathological query), falls back to the raw
         query so the caller sees zero results instead of a SQL error.
+
+        Normalization (2026-08-30): input passes NFKC+casefold FIRST so
+        query shingles meet the content_n index side in the same space
+        ('Ａ股'≡'a股', 'ＧＢＭ'≡'gbm', 'MiniMax'≡'minimax').
         """
         if not query:
             return ""
+
+        from .store import normalize_for_fts
+        query = normalize_for_fts(query)
 
         # CJK path: shingle expansion
         if cls._has_cjk(query):
@@ -880,13 +917,22 @@ class FactRetriever:
             latin_pieces = list(query.split()) + _re.split(
                 r"[\u4e00-\u9fff]+", query)
             for raw in latin_pieces:
-                cleaned = raw.strip(".,;:!?\"'()[]{}#@<>").translate(
+                cleaned = raw.strip(".,;:!?\"'()[]{}#@<>\u3002\uff0c\uff1a\uff1b\uff1f\uff01\u3001\u201c\u201d\uff08\uff09").translate(
                     str.maketrans("", "", '"()*^:+'))
-                if len(cleaned) >= 2 and cleaned not in cls._FTS_STOPWORDS \
-                        and not cls._has_cjk(cleaned):
+                if len(cleaned) < 2 or cleaned in cls._FTS_STOPWORDS \
+                        or cls._has_cjk(cleaned):
+                    continue
+                # Code-shape tokens (2513.hk / 688502 / v1.9.0) are strong
+                # discriminators — keep WHOLE instead of letting trigram
+                # fragment them into noise shingles.
+                if _CODE_TOKEN.match(cleaned):
                     token = f'"{cleaned}"'
                     if token not in latin_tokens:
                         latin_tokens.append(token)
+                    continue
+                token = f'"{cleaned}"'
+                if token not in latin_tokens:
+                    latin_tokens.append(token)
 
             or_parts = [f'"{s}"' for s in shingles] + latin_tokens
             if or_parts:

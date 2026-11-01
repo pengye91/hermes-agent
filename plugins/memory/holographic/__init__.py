@@ -183,6 +183,16 @@ class HolographicMemoryProvider(MemoryProvider):
         hrr_weight = float(self._config.get("hrr_weight", 0.3))
         temporal_decay = int(self._config.get("temporal_decay_half_life", 0))
         vec_weight = float(self._config.get("vec_weight", 0.25))
+        # 2026-11-01: in-RAM embedding-matrix capacity cap is now config-driven.
+        # The corpus silently crossed the hardcoded 50k cap on 2026-10-07
+        # (62.7k facts at diagnosis), which disabled the matrix and dropped
+        # every query onto the O(n) row-wise path — the root cause of the
+        # holographic prefetch 8s timeouts (238 in October). Default stays
+        # 50000 for upstream; this host runs 70000 (~143MB RAM at 512d).
+        try:
+            vec_cache_max_facts = int(self._config.get("vec_cache_max_facts", 50000))
+        except (TypeError, ValueError):
+            vec_cache_max_facts = 50000
 
         # Optional semantic leg: constructed only when an API key resolves.
         # No key → client.available is False → store stays purely lexical.
@@ -219,6 +229,7 @@ class HolographicMemoryProvider(MemoryProvider):
             default_trust=default_trust,
             hrr_dim=hrr_dim,
             embedding_client=self._embed_client,
+            _vec_cache_max_facts=vec_cache_max_facts,
         )
         self._retriever = FactRetriever(
             store=self._store,
@@ -422,6 +433,29 @@ class HolographicMemoryProvider(MemoryProvider):
                 # rerank='llm' (opt-in) adds a listwise LLM stage on top of
                 # the statistical ranking — judgment queries ("对X的结论")
                 # separate conclusions from evidence. Default 'off'.
+                # strategy='smart' routes through smart_search (query-type
+                # router + time-window pruning + multihop decomposition)
+                # before the optional rerank. Default 'off' keeps the exact
+                # pre-smart behaviour.
+                strategy = str(args.get("strategy", "off"))
+                if strategy == "smart":
+                    from .smart_search import smart_search as _smart
+                    from .llm_rerank import rerank_search, _RerankClient
+                    _ret = retriever
+                    results = rerank_search(
+                        lambda q, lim: _smart(
+                            _ret,
+                            q,
+                            limit=lim,
+                        ),
+                        args["query"],
+                        _RerankClient(),
+                        rerank=str(args.get("rerank", "off")),
+                        k=int(args.get("limit", 10)),
+                    )
+                    return json.dumps({"results": results,
+                                       "count": len(results)})
+
                 from .llm_rerank import rerank_search, _RerankClient
                 _ret = retriever  # non-None when handlers run (store bound)
                 results = rerank_search(

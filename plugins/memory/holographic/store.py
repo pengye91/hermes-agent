@@ -18,6 +18,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
     fact_id         INTEGER PRIMARY KEY AUTOINCREMENT,
     content         TEXT NOT NULL UNIQUE,
+    content_n       TEXT,
     category        TEXT DEFAULT 'general',
     tags            TEXT DEFAULT '',
     trust_score     REAL DEFAULT 0.5,
@@ -48,10 +49,11 @@ CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(category);
 CREATE INDEX IF NOT EXISTS idx_entities_name  ON entities(name);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
-    USING fts5(content, tags, tokenize='trigram');
+    USING fts5(content, tags, content_n, tokenize='trigram');
 CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
-    INSERT INTO facts_fts(rowid, content, tags)
-        VALUES (new.fact_id, COALESCE(new.content,''), COALESCE(new.tags,''));
+    INSERT INTO facts_fts(rowid, content, tags, content_n)
+        VALUES (new.fact_id, COALESCE(new.content,''),
+                COALESCE(new.tags,''), COALESCE(new.content_n,''));
 END;
 
 CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
@@ -60,8 +62,9 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
     DELETE FROM facts_fts WHERE rowid = old.fact_id;
-    INSERT INTO facts_fts(rowid, content, tags)
-        VALUES (new.fact_id, COALESCE(new.content,''), COALESCE(new.tags,''));
+    INSERT INTO facts_fts(rowid, content, tags, content_n)
+        VALUES (new.fact_id, COALESCE(new.content,''),
+                COALESCE(new.tags,''), COALESCE(new.content_n,''));
 END;
 
 CREATE TABLE IF NOT EXISTS memory_banks (
@@ -79,6 +82,20 @@ _HELPFUL_DELTA   =  0.05
 _UNHELPFUL_DELTA = -0.10
 _TRUST_MIN       =  0.0
 _TRUST_MAX       =  1.0
+
+
+def normalize_for_fts(text: str | None) -> str:
+    """NFKC + casefold — the FTS-side canonical form.
+
+    Applied to the content_n column AND to queries by the sanitizer so
+    both sides meet in the same space: 'Ａ股'≡'A股', 'ＧＢＭ'≡'gbm',
+    'MiniMax'≡'minimax'. Original content is NEVER touched (headers,
+    display, dedup UNIQUE all live on the raw string).
+    """
+    if not text:
+        return ""
+    import unicodedata
+    return unicodedata.normalize("NFKC", text).casefold()
 
 # Entity extraction patterns
 _RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
@@ -259,6 +276,13 @@ class MemoryStore:
         # back to source messages.
         if "msg_id" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN msg_id INTEGER")
+        # Migrate: add content_n (NFKC+casefold normalized copy for FTS).
+        # Full-width letters ('Ａ股','ＧＢＭ') and case ('minimax' vs
+        # 'MiniMax') never matched through trigram; the INDEX side needs
+        # the normalized copy (2026-08-30 forensics — CLS solved this
+        # class years ago, holo never got it).
+        if "content_n" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN content_n TEXT")
         if "embedding" not in columns:
             # Optional semantic leg (512-dim float32 BLOB, ~2KB/fact).
             # Populated asynchronously by _compute_embedding when an
@@ -272,7 +296,11 @@ class MemoryStore:
         fts_sql_row = self._conn.execute(
             "SELECT sql FROM sqlite_master WHERE name = 'facts_fts'"
         ).fetchone()
-        if fts_sql_row and "trigram" not in (fts_sql_row[0] or ""):
+        if fts_sql_row and "content_n" not in (fts_sql_row[0] or ""):
+            # Legacy trigram table — rebuild with content_n and backfill
+            # normalized copies. ORDER MATTERS: triggers must be dropped
+            # BEFORE the content_n UPDATE (the UPDATE trigger would write
+            # into the half-built FTS table and blow the rowid PK).
             self._conn.executescript(
                 """
                 DROP TRIGGER IF EXISTS facts_ai;
@@ -281,12 +309,46 @@ class MemoryStore:
                 DROP TABLE IF EXISTS facts_fts;
                 """
             )
-            self._conn.executescript(_SCHEMA)
+            rows = self._conn.execute(
+                "SELECT fact_id, content FROM facts WHERE content_n IS NULL"
+            ).fetchall()
+            for fid, content in rows:
+                self._conn.execute(
+                    "UPDATE facts SET content_n = ? WHERE fact_id = ?",
+                    (normalize_for_fts(content), fid),
+                )
+            # now create the new-shape FTS + triggers, then populate
+            self._conn.executescript(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
+                    USING fts5(content, tags, content_n, tokenize='trigram');
+                """
+            )
             self._conn.execute(
                 """
-                INSERT INTO facts_fts(rowid, content, tags)
-                SELECT fact_id, COALESCE(content, ''), COALESCE(tags, '')
+                INSERT INTO facts_fts(rowid, content, tags, content_n)
+                SELECT fact_id, COALESCE(content, ''), COALESCE(tags, ''),
+                       COALESCE(content_n, '')
                 FROM facts
+                """
+            )
+            # re-arm triggers last
+            self._conn.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+                    INSERT INTO facts_fts(rowid, content, tags, content_n)
+                    VALUES (new.fact_id, COALESCE(new.content,''),
+                            COALESCE(new.tags,''), COALESCE(new.content_n,''));
+                END;
+                CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
+                    DELETE FROM facts_fts WHERE rowid = old.fact_id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
+                    DELETE FROM facts_fts WHERE rowid = old.fact_id;
+                    INSERT INTO facts_fts(rowid, content, tags, content_n)
+                    VALUES (new.fact_id, COALESCE(new.content,''),
+                            COALESCE(new.tags,''), COALESCE(new.content_n,''));
+                END;
                 """
             )
         self._conn.commit()
@@ -318,10 +380,11 @@ class MemoryStore:
             try:
                 cur = self._conn.execute(
                     """
-                    INSERT INTO facts (content, category, tags, trust_score, msg_id)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO facts (content, content_n, category, tags, trust_score, msg_id)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (content, category, tags, self.default_trust, msg_id),
+                    (content, normalize_for_fts(content), category, tags,
+                     self.default_trust, msg_id),
                 )
                 self._conn.commit()
                 fact_id: int = cur.lastrowid  # type: ignore[assignment]
@@ -350,6 +413,14 @@ class MemoryStore:
             # Semantic vector (no-op without an embedding client)
             self._compute_embedding(fact_id, content)
             self._rebuild_bank(category)
+
+            # jieba leg realtime hook (no-op when the leg was never built;
+            # must never break the write path)
+            try:
+                from .jieba_leg import jieba_upsert_row
+                jieba_upsert_row(self, fact_id, content)
+            except Exception:
+                pass
 
             return fact_id
 
@@ -478,6 +549,12 @@ class MemoryStore:
                     self._compute_embedding(fact_id, content)
                 except Exception:
                     pass
+                # jieba leg realtime hook: content changed → refresh tokens
+                try:
+                    from .jieba_leg import jieba_upsert_row
+                    jieba_upsert_row(self, fact_id, content)
+                except Exception:
+                    pass
             # Rebuild bank for relevant category
             cat = category or self._conn.execute(
                 "SELECT category FROM facts WHERE fact_id = ?", (fact_id,)
@@ -502,6 +579,12 @@ class MemoryStore:
             self._conn.commit()
             self._invalidate_vec_cache()
             self._rebuild_bank(row["category"])
+            # jieba leg realtime hook (best-effort)
+            try:
+                from .jieba_leg import jieba_delete_row
+                jieba_delete_row(self, fact_id)
+            except Exception:
+                pass
             return True
 
     def list_facts(
