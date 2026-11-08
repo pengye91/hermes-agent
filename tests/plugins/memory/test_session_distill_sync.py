@@ -38,6 +38,17 @@ def _fast_windows(monkeypatch):
     session_distill.reset_scheduler()
 
 
+@pytest.fixture(autouse=True)
+def _distill_script_present(monkeypatch, tmp_path):
+    """Isolated HERMES_HOME has no distill script; these scheduler tests
+    assert the subprocess FIRES, so point the lazy resolver at a real file."""
+    script = tmp_path / "scripts" / "distill_llm.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("# test stub\n")
+    monkeypatch.setattr(session_distill, "_DISTILL_SCRIPT", str(script))
+    yield
+
+
 class _RunRecorder:
     """Thread-safe subprocess.run fake with optional blocking."""
 

@@ -38,9 +38,13 @@ def _ok_run(*args, **kwargs):
 # ── gate ─────────────────────────────────────────────────
 
 def test_session_end_triggers_distill(tmp_path):
+    script = tmp_path / "scripts" / "distill_llm.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("# test stub\n")
     provider = _make_provider(tmp_path, auto_extract=True)
-    with mock.patch.object(session_distill.subprocess, "run", side_effect=_ok_run) as run:
-        provider.on_session_end([{"role": "user", "content": "我们讨论了百合花，结论不参与"}])
+    with mock.patch.object(session_distill, "_DISTILL_SCRIPT", str(script)):
+        with mock.patch.object(session_distill.subprocess, "run", side_effect=_ok_run) as run:
+            provider.on_session_end([{"role": "user", "content": "我们讨论了百合花，结论不参与"}])
     assert run.call_count == 1
     cmd = run.call_args[0][0]
     assert cmd[0].endswith("python3") or "venv" in cmd[0]
@@ -104,6 +108,10 @@ def test_missing_script_skips(tmp_path):
 
 # ── runner unit ─────────────────────────────────────────
 
-def test_run_session_distillation_returns_rc():
-    with mock.patch.object(session_distill.subprocess, "run", side_effect=_ok_run):
-        assert session_distill.run_session_distillation([{"role": "user", "content": "x"}]) == 0
+def test_run_session_distillation_returns_rc(tmp_path):
+    script = tmp_path / "scripts" / "distill_llm.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("# test stub\n")
+    with mock.patch.object(session_distill, "_DISTILL_SCRIPT", str(script)):
+        with mock.patch.object(session_distill.subprocess, "run", side_effect=_ok_run):
+            assert session_distill.run_session_distillation([{"role": "user", "content": "x"}]) == 0

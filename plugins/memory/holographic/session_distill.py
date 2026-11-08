@@ -27,7 +27,17 @@ import time
 logger = logging.getLogger(__name__)
 
 # Single pipeline: the distill script IS the logic (no duplicate here).
-_DISTILL_SCRIPT = os.path.expanduser("~/.hermes/scripts/distill_llm.py")
+# Resolved lazily so tests (and profiles) get the isolated HERMES_HOME,
+# never the real home — import-time expanduser would freeze the wrong path.
+_DISTILL_SCRIPT = None
+
+
+def _distill_script_path() -> str:
+    global _DISTILL_SCRIPT
+    if _DISTILL_SCRIPT is None:
+        from hermes_constants import get_hermes_home
+        _DISTILL_SCRIPT = str(get_hermes_home() / "scripts" / "distill_llm.py")
+    return _DISTILL_SCRIPT
 _VENV_PYTHON = "/usr/local/lib/hermes-agent/venv/bin/python3"
 _SYSTEM_PYTHON = shutil.which("python3") or "/usr/bin/python3"
 _HOOK_TIMEOUT_S = 600  # worker thread budget; cron back-fills on timeout
@@ -134,12 +144,13 @@ def run_session_distillation(messages) -> int:
     """
     if not messages:
         return 0
-    if not os.path.exists(_DISTILL_SCRIPT):
+    script = _distill_script_path()
+    if not os.path.exists(script):
         logger.debug("distill script missing, skipping session distillation")
         return 0
     try:
         proc = subprocess.run(
-            [_python_exec(), _DISTILL_SCRIPT, "distill", "--workers", "2"],
+            [_python_exec(), script, "distill", "--workers", "2"],
             capture_output=True,
             text=True,
             timeout=_HOOK_TIMEOUT_S,

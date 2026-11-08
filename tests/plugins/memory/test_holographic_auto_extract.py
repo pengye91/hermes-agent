@@ -84,9 +84,13 @@ def test_auto_extract_off_values_disable_extraction(tmp_path, off_value):
 
 
 def test_enabled_fires_distill_subprocess_once(tmp_path):
+    script = tmp_path / "scripts" / "distill_llm.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("# test stub\n")
     provider = _make_provider(tmp_path, auto_extract=True)
-    with mock.patch.object(session_distill.subprocess, "run", side_effect=_ok_run) as run:
-        provider.on_session_end([_user(DECISION_MSG)])
+    with mock.patch.object(session_distill, "_DISTILL_SCRIPT", str(script)):
+        with mock.patch.object(session_distill.subprocess, "run", side_effect=_ok_run) as run:
+            provider.on_session_end([_user(DECISION_MSG)])
     assert run.call_count == 1
     # Inline store untouched — facts come from the subprocess pipeline
     assert _fact_contents(provider) == []
