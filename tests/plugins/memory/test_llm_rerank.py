@@ -69,7 +69,8 @@ def test_mixed_unseparated_latin_survives_sanitize():
     的拉丁 token 必须进 FTS 查询——空格分词永远看不到它。"""
     from plugins.memory.holographic.retrieval import FactRetriever
     q = FactRetriever._sanitize_fts_query("MiniMax的港股代码")
-    assert '"MiniMax"' in q
+    # 2026-08-30 NFKC: queries now casefold, so the literal is 'minimax'
+    assert '"minimax"' in q
     # CJK shingles 仍在
     assert '"的港股"' in q or '"股代码"' in q
 
